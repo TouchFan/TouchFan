@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.2 <0.9.0;
+
+import "./interfaces/IReferrerStorage.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract TFCommunitySharesV1 is Ownable {
+    address public protocolFeeDestination;
+    uint256 public protocolFeePercent;
+    uint256 public referrerFeePercent;
+
+    address public manager;
+    address public referrerStorage;
+    uint256 public proposalID = 1;
+    uint256 public proposalFee;
+    event Trade(
+        address trader,
+        uint256 CommunityID,
+        bool isBuy,
+        uint256 shareAmount,
+        uint256 ethAmount,
+        uint256 protocolEthAmount,
+        uint256 referrerEthAmount,
+        uint256 supply,
+        uint256 trader_balance,
+        uint256 blockTime
+    );
+
+    event ReferrerSet(address sender, address referrer, uint256 blockTime);
+
+    event FeeDestinationSet(address feeDestination);
+    event ManagerSet(address manager);
+    event ProtocolFeePercentSet(uint256 feePercent);
+
+    event ReferrerFeePercentSet(uint256 feePercent);
+
+    event ReferrerStorageSet(address referrerStorage);
+
+    event ProposalFeeSet(uint256 proposalFee);
+
+
+
+    event ProposalCreated(
+        address sender,
+        uint256 proposalID,
+        string description,
+        uint256 proposalFee,
+        uint256 blockTime
+    );
+
+    event ProposalStateUpdated(
+        address sender,
+        uint256 proposalID,
+        string description,
+        uint256 blockTime
+    );
+
+    event ForFollowersPaid(
+        address sender,
+        uint256 proposalID,
+        uint256 followersFee,
+        uint256 blockTime
+    );
+
+
+    event ProposalStateUpdatedFollowers(
+        address sender,
+        uint256 proposalID,
+        uint256 toPayFollowers,
+        uint256 toPayEthForFollowers,
+        uint256 blockTime
+    );
+
+    struct Proposal {
+        string description;
+        address proposer;
+        uint256 toPayFollowers;
+        uint256 toPayEthForFollowers;
+        uint256 forVotes;
+        uint256 timestamp;
+        bool paySuccess;
+        bool success;
+    }
+
+    mapping(uint256 => Proposal) public proposalsBy;
+
+    // sender => (description => created)
+    mapping(address => mapping(string => bool)) public createProposalRecords;
+
+    // CommunityID => (Holder => Balance)
+    mapping(uint256 => mapping(address => uint256))
+        public communitySharesBalance;
+
+    // CommunityID => Supply
+    mapping(uint256 => uint256) public communitySharesSupply;
+
+    modifier onlyManager() {
+        require(manager == msg.sender, "caller is not the manager");
+        _;
+    }
+
+    function setManager(address _manager) public onlyOwner {
+        manager = _manager;
+        emit ManagerSet(_manager);
+    }
+
+    function setFeeDestination(address _feeDestination) public onlyOwner {
+        protocolFeeDestination = _feeDestination;
+        emit FeeDestinationSet(_feeDestination);
+    }
+
+    function setProtocolFeePercent(uint256 _feePercent) public onlyOwner {
+        protocolFeePercent = _feePercent;
+        emit ProtocolFeePercentSet(_feePercent);
+    }
+
+    function setReferrerFeePercent(uint256 _feePercent) public onlyOwner {
+        referrerFeePercent = _feePercent;
+        emit ReferrerFeePercentSet(_feePercent);
+    }
+
+    function setReferrerStorage(address _referrerStorage) public onlyOwner {
+        referrerStorage = _referrerStorage;
+        emit ReferrerStorageSet(_referrerStorage);
+    }
+
+    function setProposalFee(uint256 _proposalFee) public onlyOwner {
+        proposalFee = _proposalFee;
+        emit ProposalFeeSet(_proposalFee);
+    }
+
+    function createProposal(string memory description) public payable {
+        require(msg.value >= proposalFee, "Insufficient proposalFee");
+        require(!createProposalRecords[msg.sender][description], "Proposal created");
+
+        // Get a reference to the new proposal
+        Proposal memory newProposal = Proposal({
+            description: description,
+            proposer: msg.sender,
+            forVotes: 0,
+            toPayFollowers : 0,
+            toPayEthForFollowers:0,
+            timestamp: 0,
+            paySuccess : false,
+            success: false
+        });
+        proposalsBy[proposalID] = newProposal;
+
+        (bool success1, ) = protocolFeeDestination.call{value: msg.value}("");
+        require(success1, "proposalFee send error");
+
+        createProposalRecords[msg.sender][description] = true;
+
+        emit ProposalCreated(
+            msg.sender,
+            proposalID,
+            description,
+            msg.value,
+            block.timestamp
+        );
+        proposalID = proposalID + 1;
+    }
+    function payForFollowers(uint256 _proposalID ) public payable {
+        require(!proposalsBy[_proposalID].paySuccess, "not match");
+
+        proposalsBy[_proposalID].paySuccess = true;
+
+        require(msg.value == proposalsBy[_proposalID].toPayEthForFollowers, "Insufficient payFee");
+
+
+        (bool success1, ) = protocolFeeDestination.call{value: msg.value}("");
+        require(success1, "payFee send error");
+
+        emit ForFollowersPaid(
+            msg.sender,
+            _proposalID,
+            msg.value,
+            block.timestamp
+        );
+    }
+
+    function updateProposalFollowers(uint256 _proposalID, uint256 _followers, uint256 _toPayEthForFollowers)
+    public
+    onlyManager
+    {
+        require(!proposalsBy[_proposalID].success, "not match");
+        require(!proposalsBy[_proposalID].paySuccess, "Already paid");
+
+        // Get a reference to the  proposal
+        Proposal storage proposal = proposalsBy[_proposalID];
+        // Set the fields of the proposal
+        proposal.toPayFollowers = _followers;
+        proposal.toPayEthForFollowers = _toPayEthForFollowers;
+
+        emit ProposalStateUpdatedFollowers(
+            msg.sender,
+            _proposalID,
+            _followers,
+            _toPayEthForFollowers,
+            block.timestamp
+        );
+    }
+
+    function updateProposalState(uint256 _proposalID, uint256 _forVotes)
+        public
+        onlyManager
+    {
+        require(!proposalsBy[_proposalID].success, "not match");
+
+        // Get a reference to the  proposal
+        Proposal storage proposal = proposalsBy[_proposalID];
+        // Set the fields of the proposal
+        proposal.forVotes = _forVotes;
+        proposal.success = true;
+        proposal.timestamp = block.timestamp;
+
+        emit ProposalStateUpdated(
+            msg.sender,
+            _proposalID,
+            proposal.description,
+            block.timestamp
+        );
+    }
+
+    function getPrice(uint256 supply, uint256 amount)
+        public
+        pure
+        returns (uint256)
+    {
+        uint256 sum1 = supply == 0 ? 0 : (supply)* (supply+1000000) * (2 * (supply) + 1000000) / 6;
+        uint256 sum2 =  (supply + amount) * (supply + 1000000 + amount) * (2 * (supply + amount) + 1000000) / 6;
+        uint256 summation = sum2 - sum1;
+        return summation * 1 ether / 16000000000000000000000;
+    }
+
+    function getCommunityBuyPrice(uint256 communityID, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        return getPrice(communitySharesSupply[communityID], amount);
+    }
+
+    function getCommunitySellPrice(uint256 communityID, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        return getPrice(communitySharesSupply[communityID] - amount, amount);
+    }
+
+    function getCommunityBuyPriceAfterFee(uint256 communityID, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        uint256 price = getCommunityBuyPrice(communityID, amount);
+        uint256 protocolFee = (price * protocolFeePercent) / 1 ether;
+        uint256 referrerFee = (price * referrerFeePercent) / 1 ether;
+        return price + protocolFee + referrerFee;
+    }
+
+    function getCommunitySellPriceAfterFee(uint256 communityID, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        uint256 price = getCommunitySellPrice(communityID, amount);
+        uint256 protocolFee = (price * protocolFeePercent) / 1 ether;
+        uint256 referrerFee = (price * referrerFeePercent) / 1 ether;
+        return price - protocolFee - referrerFee;
+    }
+
+    function buyCommunityShares(uint256 communityID, uint256 amount)
+        public
+        payable
+    {
+        require(amount > 0, "invalid amount");
+        address referrer = IReferrerStorage(referrerStorage).referrers(
+            msg.sender
+        );
+        require(referrer != address(0), "Need invite");
+
+        require(proposalsBy[communityID].success, "proposal not success");
+
+        uint256 supply = communitySharesSupply[communityID];
+        require(
+            supply > 0 ||
+                proposalsBy[communityID].proposer == msg.sender ||
+                block.timestamp > proposalsBy[communityID].timestamp + 24 hours,
+            "Only the shares' subject can buy the first share"
+        );
+        uint256 price = getPrice(supply, amount);
+        uint256 protocolFee = (price * protocolFeePercent) / 1 ether;
+        uint256 referrerFee = (price * referrerFeePercent) / 1 ether;
+        require(
+            msg.value >= price + protocolFee + referrerFee,
+            "Insufficient payment"
+        );
+        uint256 traderBalance = communitySharesBalance[communityID][
+            msg.sender
+        ] = communitySharesBalance[communityID][msg.sender] + amount;
+        communitySharesSupply[communityID] = supply + amount;
+        {
+            (bool success1, ) = protocolFeeDestination.call{value: protocolFee}(
+                ""
+            );
+            (bool success2, ) = referrer.call{value: referrerFee}("");
+            require(success1 && success2, "Unable to send funds");
+        }
+
+        emit Trade(
+            msg.sender,
+            communityID,
+            true,
+            amount,
+            price,
+            protocolFee,
+            referrerFee,
+            supply + amount,
+            traderBalance,
+            block.timestamp
+        );
+    }
+
+    function sellCommunityShares(uint256 communityID, uint256 amount)
+        public
+        payable
+    {
+        require(amount > 0, "invalid amount");
+        address referrer = IReferrerStorage(referrerStorage).referrers(
+            msg.sender
+        );
+        require(referrer != address(0), "Need invite");
+        //require(proposalsBy[communityID].success, "proposal not success");
+
+        uint256 supply = communitySharesSupply[communityID];
+        require(supply > amount, "Cannot sell the last share");
+        uint256 price = getPrice(supply - amount, amount);
+        uint256 protocolFee = (price * protocolFeePercent) / 1 ether;
+        uint256 referrerFee = (price * referrerFeePercent) / 1 ether;
+        require(
+            communitySharesBalance[communityID][msg.sender] >= amount,
+            "Insufficient shares"
+        );
+        uint256 traderBalance = communitySharesBalance[communityID][
+            msg.sender
+        ] = communitySharesBalance[communityID][msg.sender] - amount;
+        communitySharesSupply[communityID] = supply - amount;
+        {
+            (bool success1, ) = msg.sender.call{
+                value: price - protocolFee - referrerFee
+            }("");
+            (bool success2, ) = protocolFeeDestination.call{value: protocolFee}(
+                ""
+            );
+            (bool success3, ) = referrer.call{value: referrerFee}("");
+            require(success1 && success2 && success3, "Unable to send funds");
+        }
+        emit Trade(
+            msg.sender,
+            communityID,
+            false,
+            amount,
+            price,
+            protocolFee,
+            referrerFee,
+            supply - amount,
+            traderBalance,
+            block.timestamp
+        );
+    }
+}

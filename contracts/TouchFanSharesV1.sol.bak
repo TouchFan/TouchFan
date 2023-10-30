@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.2 <0.9.0;
+
+import "./interfaces/IReferrerStorage.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract TouchFanSharesV1 is Ownable {
+    address public protocolFeeDestination;
+    uint256 public protocolFeePercent;
+    uint256 public subjectFeePercent;
+    uint256 public referrerFeePercent;
+    address public referrerStorage;
+
+    event Trade(
+        address trader,
+        address subject,
+        bool isBuy,
+        uint256 shareAmount,
+        uint256 ethAmount,
+        uint256 protocolEthAmount,
+        uint256 subjectEthAmount,
+        uint256 referrerEthAmount,
+        uint256 supply,
+        uint256 trader_balance,
+        uint256 blockTime
+    );
+
+    event FeeDestinationSet(address feeDestination);
+
+    event ProtocolFeePercentSet(uint256 feePercent);
+    event SubjectFeePercentSet(uint256 feePercent);
+    event ReferrerFeePercentSet(uint256 feePercent);
+    event ReferrerStorageSet(address referrerStorage);
+
+    struct TradeFees {
+        uint256 protocolFee;
+        uint256 subjectFee;
+        uint256 referrerFee;
+    }
+
+    // SharesSubject => (Holder => Balance)
+    mapping(address => mapping(address => uint256)) public sharesBalance;
+
+    // SharesSubject => Supply
+    mapping(address => uint256) public sharesSupply;
+
+    function setFeeDestination(address _feeDestination) public onlyOwner {
+        protocolFeeDestination = _feeDestination;
+        emit FeeDestinationSet(_feeDestination);
+    }
+
+    function setProtocolFeePercent(uint256 _feePercent) public onlyOwner {
+        protocolFeePercent = _feePercent;
+        emit ProtocolFeePercentSet(_feePercent);
+    }
+
+    function setSubjectFeePercent(uint256 _feePercent) public onlyOwner {
+        subjectFeePercent = _feePercent;
+        emit SubjectFeePercentSet(_feePercent);
+    }
+
+    function setReferrerFeePercent(uint256 _feePercent) public onlyOwner {
+        referrerFeePercent = _feePercent;
+        emit ReferrerFeePercentSet(_feePercent);
+    }
+
+    function setReferrerStorage(address _referrerStorage) public onlyOwner {
+        referrerStorage = _referrerStorage;
+        emit ReferrerStorageSet(_referrerStorage);
+    }
+
+//    function getPrice(uint256 supply, uint256 amount)
+//        public
+//        pure
+//        returns (uint256)
+//    {
+//        uint256 sum1 = supply == 0
+//            ? 0
+//            : ((supply - 1) * (supply) * (2 * (supply - 1) + 1)) / 6;
+//        uint256 sum2 = ((amount + supply - 1) *
+//            (supply + amount) *
+//            (2 * (amount + supply - 1) + 1)) / 6;
+//        uint256 summation = sum2 - sum1;
+//        return (summation * 1 ether) / 16000000000000000000000;
+//    }
+
+    function getPrice(uint256 supply, uint256 amount) public pure returns (uint256) {
+        uint256 sum1 = supply == 0 ? 0 : (supply)* (supply+1000000) * (2 * (supply) + 1000000) / 6;
+        uint256 sum2 =  (supply + amount) * (supply + 1000000 + amount) * (2 * (supply + amount) + 1000000) / 6;
+        uint256 summation = sum2 - sum1;
+        return summation * 1 ether / 16000000000000000000000;
+    }
+
+    function getBuyPrice(address sharesSubject, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        return getPrice(sharesSupply[sharesSubject], amount);
+    }
+
+    function getSellPrice(address sharesSubject, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        return getPrice(sharesSupply[sharesSubject] - amount, amount);
+    }
+
+    function getBuyPriceAfterFee(address sharesSubject, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        uint256 price = getBuyPrice(sharesSubject, amount);
+        uint256 protocolFee = (price * protocolFeePercent) / 1 ether;
+        uint256 subjectFee = (price * subjectFeePercent) / 1 ether;
+        uint256 referrerFee = (price * referrerFeePercent) / 1 ether;
+        return price + protocolFee + subjectFee + referrerFee;
+    }
+
+    function getSellPriceAfterFee(address sharesSubject, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        uint256 price = getSellPrice(sharesSubject, amount);
+        uint256 protocolFee = (price * protocolFeePercent) / 1 ether;
+        uint256 subjectFee = (price * subjectFeePercent) / 1 ether;
+        uint256 referrerFee = (price * referrerFeePercent) / 1 ether;
+        return price - protocolFee - subjectFee - referrerFee;
+    }
+
+    function buyShares(address sharesSubject, uint256 amount) public payable {
+        require(amount > 0, "invalid amount");
+        address referrer = IReferrerStorage(referrerStorage).referrers(
+            msg.sender
+        );
+        require(referrer != address(0), "Need invite");
+        uint256 supply = sharesSupply[sharesSubject];
+        require(
+            supply > 0 || sharesSubject == msg.sender,
+            "Only the shares' subject can buy the first share"
+        );
+        uint256 price = getPrice(supply, amount);
+        TradeFees memory tradeFees;
+        tradeFees.protocolFee = (price * protocolFeePercent) / 1 ether;
+        tradeFees.subjectFee = (price * subjectFeePercent) / 1 ether;
+        tradeFees.referrerFee = (price * referrerFeePercent) / 1 ether;
+        require(
+            msg.value >=
+                price +
+                    tradeFees.protocolFee +
+                    tradeFees.subjectFee +
+                    tradeFees.referrerFee,
+            "Insufficient payment"
+        );
+        uint256 traderBalance = sharesBalance[sharesSubject][msg.sender] =
+            sharesBalance[sharesSubject][msg.sender] +
+            amount;
+        sharesSupply[sharesSubject] = supply + amount;
+
+        {
+            (bool success1, ) = protocolFeeDestination.call{
+                value: tradeFees.protocolFee
+            }("");
+            (bool success2, ) = sharesSubject.call{value: tradeFees.subjectFee}(
+                ""
+            );
+            (bool success3, ) = referrer.call{value: tradeFees.referrerFee}("");
+            require(success1 && success2 && success3, "Unable to send funds");
+        }
+
+        emit Trade(
+            msg.sender,
+            sharesSubject,
+            true,
+            amount,
+            price,
+            tradeFees.protocolFee,
+            tradeFees.subjectFee,
+            tradeFees.referrerFee,
+            supply + amount,
+            traderBalance,
+            block.timestamp
+        );
+    }
+
+    function sellShares(address sharesSubject, uint256 amount) public payable {
+        require(amount > 0, "invalid amount");
+        address referrer = IReferrerStorage(referrerStorage).referrers(
+            msg.sender
+        );
+        require(referrer != address(0), "Need invite");
+        uint256 supply = sharesSupply[sharesSubject];
+        require(supply > amount, "Cannot sell the last share");
+        uint256 price = getPrice(supply - amount, amount);
+
+        TradeFees memory tradeFees;
+
+        tradeFees.protocolFee = (price * protocolFeePercent) / 1 ether;
+        tradeFees.subjectFee = (price * subjectFeePercent) / 1 ether;
+        tradeFees.referrerFee = (price * referrerFeePercent) / 1 ether;
+        require(
+            sharesBalance[sharesSubject][msg.sender] >= amount,
+            "Insufficient shares"
+        );
+        uint256 traderBalance = sharesBalance[sharesSubject][msg.sender] =
+            sharesBalance[sharesSubject][msg.sender] -
+            amount;
+        sharesSupply[sharesSubject] = supply - amount;
+        {
+            (bool success1, ) = msg.sender.call{
+                value: price -
+                    tradeFees.protocolFee -
+                    tradeFees.subjectFee -
+                    tradeFees.referrerFee
+            }("");
+            (bool success2, ) = protocolFeeDestination.call{
+                value: tradeFees.protocolFee
+            }("");
+            (bool success3, ) = sharesSubject.call{value: tradeFees.subjectFee}(
+                ""
+            );
+            (bool success4, ) = referrer.call{value: tradeFees.referrerFee}("");
+            require(
+                success1 && success2 && success3 && success4,
+                "Unable to send funds"
+            );
+        }
+        emit Trade(
+            msg.sender,
+            sharesSubject,
+            false,
+            amount,
+            price,
+            tradeFees.protocolFee,
+            tradeFees.subjectFee,
+            tradeFees.referrerFee,
+            supply - amount,
+            traderBalance,
+            block.timestamp
+        );
+    }
+}
